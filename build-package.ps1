@@ -6,7 +6,7 @@
     Copies only the files Chrome actually needs into a staging folder, validates
     the manifest and icons, then produces dist/d365-env-comparison-<version>.zip.
 
-    Development-only files (loop notes, README, store screenshots, git metadata)
+    Development-only files (README, store screenshots, git metadata)
     are deliberately excluded so reviewers see a minimal, purposeful package.
 
 .EXAMPLE
