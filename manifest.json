@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "D365 Environment Comparison",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "short_name": "D365 Env Comparison",
   "description": "Compare D365 Finance & Operations data entities and records across environments.",
   "icons": {
