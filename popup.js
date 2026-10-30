@@ -307,11 +307,111 @@ function refreshPickers(){
   });
 }
 
-/* NOTE: Stub for legal entity filter hydration.
-   Intentionally no-op for now; future implementation can populate
-   company options from a legal entities endpoint. */
+/* ── Legal entity dropdown: discovered per environment, cached by env URL ── */
+var LE_CACHE_KEY = 'd365_legal_entities';
+var _legalEntityRefresh = null;
+
+function getLegalEntityCache(){
+  try { return JSON.parse(localStorage.getItem(LE_CACHE_KEY) || '{}') || {}; }
+  catch(e) { return {}; }
+}
+
+function setLegalEntityCache(cache){
+  try { localStorage.setItem(LE_CACHE_KEY, JSON.stringify(cache)); } catch(e) {}
+}
+
+function getLegalEntityCandidates(origin){
+  return [
+    origin + '/data/LegalEntities?$select=LegalEntityId,Name',
+    origin + '/data/LegalEntities'
+  ];
+}
+
+function parseLegalEntities(raw){
+  var rows = Array.isArray(raw) ? raw : (raw && raw.value ? raw.value : []);
+  var seen = {};
+  var out = [];
+  rows.forEach(function(r){
+    if (!r) return;
+    var id = String(r.LegalEntityId || r.DataArea || r.DataAreaId || r.dataAreaId || '').trim().toUpperCase();
+    if (!id || seen[id]) return;
+    seen[id] = true;
+    out.push({ id: id, name: String(r.Name || r.name || '').trim() });
+  });
+  return out;
+}
+
+async function fetchLegalEntities(envUrl){
+  var found = await findD365Tab(envUrl);
+  if (!found.tab) return null;
+  var working = await tryCandidateEndpoints(found, envUrl, getLegalEntityCandidates, null, 10000);
+  if (!working.ok || !working.res) return null;
+  var list = parseLegalEntities(working.res.data);
+  return list.length ? list : null;
+}
+
+function ensureCompanyOption(companyEl, value){
+  if (!value || value === '__custom__') return;
+  var exists = Array.prototype.some.call(companyEl.options, function(o){ return o.value === value; });
+  if (exists) return;
+  var opt = document.createElement('option');
+  opt.value = value;
+  opt.textContent = value;
+  companyEl.insertBefore(opt, companyEl.querySelector('option[value="__custom__"]'));
+}
+
+function renderLegalEntityOptions(){
+  var companyEl = document.getElementById('company');
+  if (!companyEl) return;
+  var cache = getLegalEntityCache();
+  var urlA = getEnvUrl('A'), urlB = getEnvUrl('B');
+  var listA = (urlA && cache[urlA]) || [];
+  var listB = (urlB && cache[urlB]) || [];
+  var hasBoth = listA.length && listB.length;
+  // Only legal entities present in both Source and Target are comparable.
+  var idsB = {};
+  listB.forEach(function(le){ idsB[le.id] = le; });
+  var items = hasBoth ? listA.filter(function(le){ return idsB[le.id]; }).map(function(le){
+    return { id: le.id, name: le.name || idsB[le.id].name };
+  }).sort(function(x, y){ return x.id.localeCompare(y.id); }) : [];
+
+  var current = companyEl.value;
+  var html = '<option value="">All legal entities</option>' +
+    items.map(function(le){
+      var label = le.id + (le.name ? ' \u2014 ' + le.name : '');
+      return '<option value="' + esc(le.id) + '">' + esc(label) + '</option>';
+    }).join('') +
+    '<option value="__custom__">Enter custom\u2026</option>';
+  companyEl.innerHTML = html;
+  if (hasBoth && current && current !== '__custom__' && !items.some(function(le){ return le.id === current; })) {
+    current = '';
+  } else {
+    ensureCompanyOption(companyEl, current);
+  }
+  companyEl.value = current;
+  onCompanySelectChange();
+}
+
 function refreshLegalEntityFilters(){
-  return Promise.resolve();
+  renderLegalEntityOptions();
+  if (!IS_EXT) return Promise.resolve();
+  if (_legalEntityRefresh) return _legalEntityRefresh;
+  var urls = [getEnvUrl('A'), getEnvUrl('B')].filter(function(u, i, arr){
+    return u && isHttps(u) && arr.indexOf(u) === i;
+  });
+  _legalEntityRefresh = Promise.all(urls.map(function(url){
+    return fetchLegalEntities(url).then(function(list){
+      if (!list) return;
+      var cache = getLegalEntityCache();
+      cache[url] = list;
+      setLegalEntityCache(cache);
+    }).catch(function(){});
+  })).then(function(){
+    renderLegalEntityOptions();
+  }).finally(function(){
+    _legalEntityRefresh = null;
+  });
+  return _legalEntityRefresh;
 }
 
 async function addOrUpdateProfile(){
@@ -467,7 +567,8 @@ function restore(){
     if(d.selB){_selB=d.selB;}
     refreshPickers();
     var companyEl=document.getElementById('company');
-    if(d.company && companyEl){companyEl.value=d.company;}
+    renderLegalEntityOptions();
+    if(d.company && companyEl){ensureCompanyOption(companyEl, d.company);companyEl.value=d.company;}
     var companyCustomEl=document.getElementById('companyCustom');
     if(d.companyCustom && companyCustomEl)companyCustomEl.value=d.companyCustom;
     if(d.rowLimit != null){
@@ -1193,6 +1294,8 @@ function getMetadataCandidates(origin) {
 
 function getDataManagementCandidates(origin) {
   return [
+    origin + '/data/DataManagementEntities?$select=EntityName,TargetName,Modules,IsShared&$top=10000',
+    origin + '/data/DataManagementEntities?$select=EntityName,TargetName',
     origin + '/data/DataManagementEntities?$top=10000&cross-company=true',
     origin + '/data/DataManagementEntities?$top=10000',
     origin + '/data/DataManagementEntities'
@@ -1226,12 +1329,12 @@ function getValidationCandidates(origin) {
 /* ── Try a list of endpoints against a tab, return first raw JSON that yields usable data.
    validateFn (optional): called with (data) — must return true for the result to be accepted.
    When omitted the raw JSON is accepted as soon as the request succeeds (raw mode). ── */
-async function _tryEndpointList(tabId, endpoints, host, validateFn) {
+async function _tryEndpointList(tabId, endpoints, host, validateFn, timeoutMs) {
   var lastErr = '';
   for (var i = 0; i < endpoints.length; i++) {
     var res;
     try {
-      res = await probeEndpointWithTimeout(tabId, endpoints[i], 12000);
+      res = await probeEndpointWithTimeout(tabId, endpoints[i], timeoutMs || 12000);
     } catch(e) {
       lastErr = e && e.message ? e.message : String(e);
       continue;
@@ -1278,9 +1381,10 @@ function _mergeDataManagementData(entityRaw, dataManagementRaw) {
   var dataManagementList = Array.isArray(dataManagementRaw) ? dataManagementRaw : (dataManagementRaw && dataManagementRaw.value ? dataManagementRaw.value : []);
   var dmfMap = {};
   dataManagementList.forEach(function(e) {
-    var targetName = (e && (e.TargetName || e.targetName)) || '';
+    var targetName = (e && (e.TargetName || e.targetName || e.TargetEntity)) || '';
     if (!targetName) return;
-    dmfMap[targetName] = {
+    // DMF stores TargetName upper-cased (e.g. VENDVENDORPARAMETERSENTITY), so join case-insensitively.
+    dmfMap[String(targetName).toLowerCase()] = {
       dmfName: getEntityDmfName(e),
       modules: e.Modules || e.modules || '',
       isShared: e.IsShared,
@@ -1291,7 +1395,7 @@ function _mergeDataManagementData(entityRaw, dataManagementRaw) {
   var entityList = Array.isArray(entityRaw) ? entityRaw : (entityRaw && entityRaw.value ? entityRaw.value : []);
   var merged = entityList.map(function(e) {
     var joinKey = getEntityJoinKey(e);
-    var dmfEntry = joinKey && dmfMap[joinKey];
+    var dmfEntry = joinKey && dmfMap[String(joinKey).toLowerCase()];
     if (!dmfEntry) return e;
     var patch = {};
     if (dmfEntry.dmfName && !getEntityDmfName(e)) patch.DmfName = dmfEntry.dmfName;
@@ -1303,6 +1407,8 @@ function _mergeDataManagementData(entityRaw, dataManagementRaw) {
 
   return Array.isArray(entityRaw) ? merged : Object.assign({}, entityRaw, { value: merged });
 }
+
+var _lastDmfError = {};
 
 /* ── Fetch ── */
 async function fetchEntities(envUrl, slot){
@@ -1331,7 +1437,11 @@ async function fetchEntities(envUrl, slot){
   var metaResult = await _tryEndpointList(tabId, getMetadataCandidates(origin), host, _entityValidator);
 
   // ── Pass 3: try DataManagementEntities (TargetName -> EntityName / Modules) ──
-  var dmfResult = await _tryEndpointList(tabId, getDataManagementCandidates(origin), host);
+  var dmfResult = await _tryEndpointList(tabId, getDataManagementCandidates(origin), host, function(data) {
+    var list = Array.isArray(data) ? data : (data && data.value ? data.value : []);
+    return list.length > 0;
+  }, 45000);
+  _lastDmfError[slot] = dmfResult.data ? '' : (dmfResult.lastErr || 'no data');
 
   var mergedData = null;
 
@@ -1447,7 +1557,9 @@ async function loadEntities(){
       var raw = await fetchEntities(url, slot);
       var entities = normaliseEntities(raw);
       if(!entities.length) throw new Error('No entities returned — endpoint responded but list is empty.');
-      setSt(stId,'ok',label+' \u2014 '+entities.length+' entities loaded \u2713');
+      var dmfCount = entities.filter(function(e){ return e.dmfName; }).length;
+      var dmfNote = dmfCount ? ' ('+dmfCount+' DMF names)' : ' (DMF names unavailable: '+esc(_lastDmfError[slot] || 'no match')+')';
+      setSt(stId,'ok',label+' \u2014 '+entities.length+' entities loaded \u2713'+dmfNote);
       return { ok:true, entities:entities };
     }catch(e){ setSt(stId,'error',label+' \u2014 '+e.message); return { ok:false, entities:[] }; }
   }
@@ -3407,6 +3519,7 @@ async function runDiagnose(){
     renderProfileList();
     refreshPickers();
     restore();
+    refreshLegalEntityFilters().catch(function(){});
     if(isFullPage){
       restoreComparisonSnapshot().then(function(restored){
         if(restored) toast('Restored loaded entity list.');
@@ -3428,8 +3541,8 @@ async function runDiagnose(){
       toast('⚠️ Could not delete profile: '+(err && err.message ? err.message : String(err)));
     });
   });
-  bind('pickerA','change',function(){loadSlot('A');persist();});
-  bind('pickerB','change',function(){loadSlot('B');persist();});
+  bind('pickerA','change',function(){loadSlot('A');persist();refreshLegalEntityFilters().catch(function(){});});
+  bind('pickerB','change',function(){loadSlot('B');persist();refreshLegalEntityFilters().catch(function(){});});
 
   ['modalCloseBtn','modalGotItBtn'].forEach(function(id){
     var el=document.getElementById(id);if(el)el.addEventListener('click',hideTokenModal);
